@@ -2,31 +2,31 @@
  * Packed Radix Trie — compact serialization format for trie-powered autocomplete.
  *
  * Compresses a list of entries (text + score) into a packed string that:
- * - Is 2–3x smaller than raw JSON after gzip
+ * - Is 2–3x smaller than equivalent JSON
+ * - Gzips even better than JSON (structured format = more redundancy for gzip)
  * - Can be served as a static file, API response, or RSC prop
  * - Hydrates into a searchable RadixTrie on the client
  *
- * ## Format (line-based, three sections separated by "---")
+ * ## Format v2 (line-based)
+ *
+ * The packed trie has two sections separated by "---":
  *
  * ```
- * PTRIE:1:CI                         # Header: magic, version, flags (CI/CS)
- * New York                           # Entry texts, one per line
- * New Orleans
- * ...
- * ---                                # Section separator
- * 0.95,0.9,0.88                      # Scores, comma-separated
- * ---                                # Section separator
- * -|new >1|san >2|los >3             # Node 0 (root): no entries, 3 children
- * 0|york>4| orleans>5| delhi>6       # Node 1: entry #0, 3 children
- * 1,2| francisco>7|diego>8|jose>9    # Node 2: entries #1,#2, 3 children
- * 3                                  # Node 3: entry #3, leaf
+ * PTRIE:2:CI:S                      # Header: magic, version, flags, features
+ * 0.95,0.90,0.85                    # Score table (DFS order) — omitted if no scores
+ * ---
+ * -|New >1|San >2|Los >3            # Node 0 (root): no entry, 3 children
+ * !| York>4| Orleans>5| Delhi>6     # Node 1: terminal (!), 3 children
+ * !| Francisco>7|Diego>8|Jose>9     # Node 2: terminal (!), 3 children
+ * !                                 # Node 3: terminal, leaf
  * ```
  *
- * Edge labels in the node section are normalized (lowercase for CI mode).
- * Original-case texts are stored in section 1 for display.
+ * Key design: edge labels are stored in ORIGINAL CASE. Texts are reconstructed
+ * by concatenating edge labels from root to terminal nodes. No separate text
+ * section needed — the trie structure IS the data.
  */
 
-import { RadixTrie, type RadixNode, type RadixEdge } from './radix';
+import { RadixTrie } from './radix';
 import type { TrieEntry } from './trie';
 
 // ─── Public API ─────────────────────────────────────────────────────
@@ -61,14 +61,13 @@ export function packTrie(
   options?: PackOptions,
 ): string {
   const precision = options?.scorePrecision ?? 2;
-
-  // Build a packing trie (preserves original order for entry indexing)
   const packer = new TriePacker(precision);
+
   for (let i = 0; i < entries.length; i++) {
-    packer.insert(entries[i].text, entries[i].score ?? 0, i);
+    packer.insert(entries[i].text, entries[i].score ?? 0);
   }
 
-  return packer.pack(entries);
+  return packer.pack();
 }
 
 /**
@@ -100,9 +99,9 @@ export function packStats(
   const rawJson = JSON.stringify(entries);
   const rawJsonBytes = new TextEncoder().encode(rawJson).length;
 
-  // Count nodes by counting lines in node section
   const sections = packed.split('\n---\n');
-  const nodeLines = sections[2]?.split('\n').filter((l) => l.length > 0) ?? [];
+  const nodeSection = sections[sections.length - 1];
+  const nodeLines = nodeSection?.split('\n').filter((l) => l.length > 0) ?? [];
 
   return {
     entryCount: entries.length,
@@ -116,12 +115,16 @@ export function packStats(
 // ─── Packing ────────────────────────────────────────────────────────
 
 interface PackNode {
+  /** Children keyed by normalized first character. */
   children: Map<string, { label: string; node: PackNode }>;
-  entryIndices: number[]; // indices into the entries array
+  /** Whether a word terminates at this node. */
+  isTerminal: boolean;
+  /** Score for the entry at this node (if terminal). */
+  score: number;
 }
 
 function createPackNode(): PackNode {
-  return { children: new Map(), entryIndices: [] };
+  return { children: new Map(), isTerminal: false, score: 0 };
 }
 
 class TriePacker {
@@ -132,109 +135,133 @@ class TriePacker {
     this.precision = precision;
   }
 
-  insert(text: string, score: number, entryIndex: number): void {
-    const normalized = text.toLowerCase();
-    this.insertAt(this.root, normalized, 0, entryIndex);
+  /**
+   * Insert a word. Edge labels preserve the original case from the
+   * FIRST insertion that creates each edge. Lookup uses normalized
+   * comparison so "New York" and "new york" share structure.
+   */
+  insert(text: string, score: number): void {
+    this.insertAt(this.root, text, text.toLowerCase(), 0, score);
   }
 
-  private insertAt(node: PackNode, text: string, pos: number, entryIndex: number): void {
-    if (pos >= text.length) {
-      node.entryIndices.push(entryIndex);
+  private insertAt(
+    node: PackNode,
+    original: string,
+    normalized: string,
+    pos: number,
+    score: number,
+  ): void {
+    if (pos >= normalized.length) {
+      node.isTerminal = true;
+      node.score = score;
       return;
     }
 
-    const ch = text[pos];
+    const ch = normalized[pos]; // normalized char for map key
     const edge = node.children.get(ch);
 
     if (!edge) {
+      // No matching edge — create leaf with original-case label
       const leaf = createPackNode();
-      leaf.entryIndices.push(entryIndex);
-      node.children.set(ch, { label: text.slice(pos), node: leaf });
+      leaf.isTerminal = true;
+      leaf.score = score;
+      node.children.set(ch, { label: original.slice(pos), node: leaf });
       return;
     }
 
+    // Compare normalized versions to find common prefix
     const label = edge.label;
+    const labelNorm = label.toLowerCase();
     let j = 0;
-    const maxJ = Math.min(label.length, text.length - pos);
-    while (j < maxJ && label[j] === text[pos + j]) {
+    const maxJ = Math.min(labelNorm.length, normalized.length - pos);
+    while (j < maxJ && labelNorm[j] === normalized[pos + j]) {
       j++;
     }
 
-    if (j === label.length) {
-      this.insertAt(edge.node, text, pos + j, entryIndex);
+    if (j === labelNorm.length) {
+      // Full edge match — continue inserting
+      this.insertAt(edge.node, original, normalized, pos + j, score);
       return;
     }
 
-    // Split
+    // Partial match — split the edge
     const splitNode = createPackNode();
-    splitNode.children.set(label[j], { label: label.slice(j), node: edge.node });
+
+    // Reattach old child with the suffix of the old label
+    const oldSuffix = label.slice(j);
+    splitNode.children.set(oldSuffix[0].toLowerCase(), {
+      label: oldSuffix,
+      node: edge.node,
+    });
+
+    // Update parent edge to point to splitNode with the common prefix
     node.children.set(ch, { label: label.slice(0, j), node: splitNode });
 
-    if (pos + j >= text.length) {
-      splitNode.entryIndices.push(entryIndex);
+    if (pos + j >= normalized.length) {
+      // New word ends at the split point
+      splitNode.isTerminal = true;
+      splitNode.score = score;
     } else {
+      // New word continues — create new leaf with original-case suffix
       const newLeaf = createPackNode();
-      newLeaf.entryIndices.push(entryIndex);
-      splitNode.children.set(text[pos + j], { label: text.slice(pos + j), node: newLeaf });
+      newLeaf.isTerminal = true;
+      newLeaf.score = score;
+      const newSuffix = original.slice(pos + j);
+      splitNode.children.set(newSuffix[0].toLowerCase(), {
+        label: newSuffix,
+        node: newLeaf,
+      });
     }
   }
 
-  pack(entries: Array<{ text: string; score?: number }>): string {
+  pack(): string {
     const lines: string[] = [];
 
-    // Section 1: Header + entry texts
-    lines.push('PTRIE:1:CI');
-    for (const entry of entries) {
-      lines.push(entry.text);
+    // Collect scores in DFS order to check if we need them
+    const scores: number[] = [];
+    const collectScores = (node: PackNode) => {
+      if (node.isTerminal) scores.push(node.score);
+      const sorted = [...node.children.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+      for (const [, edge] of sorted) collectScores(edge.node);
+    };
+    collectScores(this.root);
+
+    const hasScores = scores.some((s) => s !== 0);
+
+    // Header
+    const features = hasScores ? ':S' : '';
+    lines.push(`PTRIE:2:CI${features}`);
+
+    // Score table (only if needed)
+    if (hasScores) {
+      lines.push(scores.map((s) => s.toFixed(this.precision)).join(','));
     }
 
     // Section separator
     lines.push('---');
 
-    // Section 2: Scores
-    const scores = entries.map((e) => (e.score ?? 0).toFixed(this.precision));
-    lines.push(scores.join(','));
-
-    // Section separator
-    lines.push('---');
-
-    // Section 3: Node table (BFS order)
+    // Node table (BFS order)
     const nodeOrder: PackNode[] = [];
     const nodeIndexMap = new Map<PackNode, number>();
 
-    // BFS to assign indices
     const queue: PackNode[] = [this.root];
     while (queue.length > 0) {
       const node = queue.shift()!;
-      const idx = nodeOrder.length;
+      nodeIndexMap.set(node, nodeOrder.length);
       nodeOrder.push(node);
-      nodeIndexMap.set(node, idx);
 
-      // Sort children by first character for deterministic output
-      const sortedChildren = [...node.children.entries()].sort((a, b) =>
-        a[0].localeCompare(b[0]),
-      );
-      for (const [, edge] of sortedChildren) {
+      const sorted = [...node.children.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+      for (const [, edge] of sorted) {
         queue.push(edge.node);
       }
     }
 
     // Encode each node
     for (const node of nodeOrder) {
-      let line = '';
+      let line = node.isTerminal ? '!' : '-';
 
-      // Entry indices
-      if (node.entryIndices.length > 0) {
-        line += node.entryIndices.join(',');
-      } else {
-        line += '-';
-      }
-
-      // Children
-      const sortedChildren = [...node.children.entries()].sort((a, b) =>
-        a[0].localeCompare(b[0]),
-      );
-      for (const [, edge] of sortedChildren) {
+      const sorted = [...node.children.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+      for (const [, edge] of sorted) {
         const childIdx = nodeIndexMap.get(edge.node)!;
         line += '|' + escapeLabel(edge.label) + '>' + childIdx.toString(36);
       }
@@ -256,12 +283,13 @@ interface ParsedTrie {
 
 function parse(packed: string): ParsedTrie {
   const sections = packed.split('\n---\n');
-  if (sections.length !== 3) {
-    throw new Error(`Invalid packed trie: expected 3 sections, got ${sections.length}`);
+  if (sections.length < 2) {
+    throw new Error(`Invalid packed trie: expected at least 2 sections, got ${sections.length}`);
   }
 
-  // Section 1: Header + texts
-  const headerLines = sections[0].split('\n');
+  // Parse header section (may include score line)
+  const headerSection = sections[0];
+  const headerLines = headerSection.split('\n');
   const header = headerLines[0];
   const headerParts = header.split(':');
 
@@ -270,54 +298,95 @@ function parse(packed: string): ParsedTrie {
   }
 
   const version = parseInt(headerParts[1], 10);
-  if (version !== 1) {
+  if (version !== 1 && version !== 2) {
     throw new Error(`Unsupported packed trie version: ${version}`);
   }
 
   const caseSensitive = headerParts[2] === 'CS';
-  const texts = headerLines.slice(1);
+  const hasScores = headerParts.includes('S');
 
-  // Section 2: Scores
-  const scoreStr = sections[1].trim();
-  const scores = scoreStr.length > 0 ? scoreStr.split(',').map(Number) : [];
+  // v1: 3 sections (header+texts, scores, nodes)
+  // v2: 2 sections (header+optional_scores, nodes)
+  if (version === 1) {
+    return parseV1(sections, caseSensitive);
+  }
 
-  // Section 3: Nodes
-  const nodeLines = sections[2].split('\n').filter((l) => l.length > 0);
+  // Parse scores (v2: second line of header section, if present)
+  let scores: number[] = [];
+  if (hasScores && headerLines.length > 1) {
+    const scoreStr = headerLines[1].trim();
+    if (scoreStr.length > 0) {
+      scores = scoreStr.split(',').map(Number);
+    }
+  }
+
+  // Node section (last section)
+  const nodeSection = sections[sections.length - 1];
+  const nodeLines = nodeSection.split('\n').filter((l) => l.length > 0);
 
   // Parse nodes
-  const nodes: Array<{
-    entryIndices: number[];
+  interface ParsedNode {
+    isTerminal: boolean;
     children: Array<{ label: string; childIndex: number }>;
-  }> = [];
+  }
 
+  const nodes: ParsedNode[] = [];
   for (const line of nodeLines) {
-    const node: { entryIndices: number[]; children: Array<{ label: string; childIndex: number }> } =
-      { entryIndices: [], children: [] };
-
-    // Split into segments by unescaped |
     const segments = splitUnescaped(line, '|');
+    const marker = segments[0];
+    const isTerminal = marker === '!';
 
-    // First segment is entry indices
-    const entryPart = segments[0];
-    if (entryPart !== '-') {
-      node.entryIndices = entryPart.split(',').map(Number);
-    }
-
-    // Remaining segments are children: label>childIndex
+    const children: Array<{ label: string; childIndex: number }> = [];
     for (let i = 1; i < segments.length; i++) {
       const seg = segments[i];
       const gtIdx = findUnescaped(seg, '>');
       if (gtIdx === -1) continue;
-
       const label = unescapeLabel(seg.slice(0, gtIdx));
       const childIndex = parseInt(seg.slice(gtIdx + 1), 36);
-      node.children.push({ label, childIndex });
+      children.push({ label, childIndex });
     }
 
-    nodes.push(node);
+    nodes.push({ isTerminal, children });
   }
 
-  // Build entries from texts and scores
+  // Reconstruct entries by DFS traversal (collect texts from edge labels)
+  const entries: Array<{ text: string; score: number }> = [];
+  let scoreIdx = 0;
+
+  const dfs = (nodeIdx: number, pathParts: string[]) => {
+    const node = nodes[nodeIdx];
+    if (node.isTerminal) {
+      const text = pathParts.join('');
+      const score = scoreIdx < scores.length ? scores[scoreIdx] : 0;
+      entries.push({ text, score });
+      scoreIdx++;
+    }
+    for (const child of node.children) {
+      pathParts.push(child.label);
+      dfs(child.childIndex, pathParts);
+      pathParts.pop();
+    }
+  };
+
+  if (nodes.length > 0) {
+    dfs(0, []);
+  }
+
+  return { version, caseSensitive, entries };
+}
+
+/** Parse v1 format (backward compatibility). */
+function parseV1(sections: string[], caseSensitive: boolean): ParsedTrie {
+  if (sections.length !== 3) {
+    throw new Error(`Invalid v1 packed trie: expected 3 sections, got ${sections.length}`);
+  }
+
+  const headerLines = sections[0].split('\n');
+  const texts = headerLines.slice(1);
+
+  const scoreStr = sections[1].trim();
+  const scores = scoreStr.length > 0 ? scoreStr.split(',').map(Number) : [];
+
   const entries: Array<{ text: string; score: number }> = [];
   for (let i = 0; i < texts.length; i++) {
     entries.push({
@@ -326,12 +395,11 @@ function parse(packed: string): ParsedTrie {
     });
   }
 
-  return { version, caseSensitive, entries };
+  return { version: 1, caseSensitive, entries };
 }
 
 // ─── Escaping ───────────────────────────────────────────────────────
 
-/** Escape special characters in edge labels: |, >, \, newline */
 function escapeLabel(label: string): string {
   let result = '';
   for (const ch of label) {
@@ -355,7 +423,6 @@ function escapeLabel(label: string): string {
   return result;
 }
 
-/** Unescape a label string. */
 function unescapeLabel(label: string): string {
   let result = '';
   let i = 0;
@@ -383,7 +450,6 @@ function unescapeLabel(label: string): string {
   return result;
 }
 
-/** Split a string by an unescaped delimiter. */
 function splitUnescaped(str: string, delim: string): string[] {
   const parts: string[] = [];
   let current = '';
@@ -406,7 +472,6 @@ function splitUnescaped(str: string, delim: string): string[] {
   return parts;
 }
 
-/** Find the index of an unescaped character. */
 function findUnescaped(str: string, ch: string): number {
   let i = 0;
   while (i < str.length) {
