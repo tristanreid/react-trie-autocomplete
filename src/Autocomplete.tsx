@@ -22,8 +22,26 @@ import {
   type ChangeEvent,
 } from 'react';
 import { AutocompleteTrie, type TrieEntry } from './trie';
+import { unpackTrie } from './pack';
+import type { RadixTrie } from './radix';
 
 // ─── Types ──────────────────────────────────────────────────────────
+
+/** Stats emitted when a packed trie is loaded. */
+export interface TrieLoadStats {
+  /** Number of entries in the trie. */
+  entries: number;
+  /** Number of radix nodes. */
+  nodes: number;
+  /** Size of the packed data in bytes. */
+  bytes: number;
+}
+
+/** A searchable trie interface (both AutocompleteTrie and RadixTrie satisfy this). */
+interface Searchable<T> {
+  search(prefix: string, limit?: number): TrieEntry<T>[];
+  readonly size: number;
+}
 
 export interface TrieAutocompleteProps<T = undefined> {
   /**
@@ -31,10 +49,16 @@ export interface TrieAutocompleteProps<T = undefined> {
    * - `items`: array of strings (simplest)
    * - `entries`: array of { text, score?, data? } objects
    * - `trie`: a pre-built AutocompleteTrie instance
+   * - `src`: URL to a packed trie file (fetched and hydrated)
+   * - `packed`: a pre-packed trie string (for SSR / React Server Components)
    */
   items?: string[];
   entries?: Array<{ text: string; score?: number; data?: T }>;
   trie?: AutocompleteTrie<T>;
+  /** URL to fetch a packed trie from. Triggers async fetch-and-hydrate. */
+  src?: string;
+  /** Pre-packed trie string (from packTrie()). For SSR / React Server Components. */
+  packed?: string;
 
   /** Controlled value. */
   value?: string;
@@ -54,6 +78,11 @@ export interface TrieAutocompleteProps<T = undefined> {
 
   /** Custom suggestion renderer. */
   renderSuggestion?: (entry: TrieEntry<T>, query: string, isHighlighted: boolean) => ReactNode;
+
+  /** Custom loading indicator (shown while fetching packed trie from `src`). */
+  loading?: ReactNode;
+  /** Called when a packed trie (from `src` or `packed`) finishes loading. */
+  onLoad?: (stats: TrieLoadStats) => void;
 
   /** CSS class for the container. */
   className?: string;
@@ -134,6 +163,8 @@ export function TrieAutocomplete<T = undefined>(props: TrieAutocompleteProps<T>)
     items,
     entries,
     trie: externalTrie,
+    src,
+    packed,
     value: controlledValue,
     defaultValue = '',
     onChange,
@@ -142,6 +173,8 @@ export function TrieAutocomplete<T = undefined>(props: TrieAutocompleteProps<T>)
     maxSuggestions = 8,
     minChars = 1,
     renderSuggestion,
+    loading: loadingIndicator,
+    onLoad,
     className,
     inputClassName,
     dropdownClassName,
@@ -151,13 +184,72 @@ export function TrieAutocomplete<T = undefined>(props: TrieAutocompleteProps<T>)
     id,
   } = props;
 
-  // Build trie from data
-  const trie = useMemo(() => {
+  // ─── Packed trie from `packed` prop (synchronous) ───
+  const packedTrie = useMemo(() => {
+    if (!packed) return null;
+    return unpackTrie<T>(packed);
+  }, [packed]);
+
+  // ─── Packed trie from `src` prop (async fetch) ───
+  const [fetchedTrie, setFetchedTrie] = useState<RadixTrie<T> | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+
+  useEffect(() => {
+    if (!src) {
+      setFetchedTrie(null);
+      return;
+    }
+
+    let cancelled = false;
+    setIsLoading(true);
+
+    fetch(src)
+      .then((res) => {
+        if (!res.ok) throw new Error(`Failed to fetch trie: ${res.status}`);
+        return res.text();
+      })
+      .then((text) => {
+        if (cancelled) return;
+        const trie = unpackTrie<T>(text);
+        setFetchedTrie(trie);
+        onLoad?.({
+          entries: trie.size,
+          nodes: trie.nodeCount,
+          bytes: new TextEncoder().encode(text).length,
+        });
+      })
+      .catch((err) => {
+        if (!cancelled) console.error('TrieAutocomplete: failed to load packed trie', err);
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [src]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Notify onLoad for synchronous packed prop
+  useEffect(() => {
+    if (packedTrie && packed) {
+      onLoad?.({
+        entries: packedTrie.size,
+        nodes: packedTrie.nodeCount,
+        bytes: new TextEncoder().encode(packed).length,
+      });
+    }
+  }, [packedTrie]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Build trie from data — priority: src > packed > trie > entries > items
+  const trie: Searchable<T> = useMemo(() => {
+    if (fetchedTrie) return fetchedTrie;
+    if (packedTrie) return packedTrie;
     if (externalTrie) return externalTrie;
     if (entries) return AutocompleteTrie.fromEntries<T>(entries);
-    if (items) return AutocompleteTrie.fromStrings(items);
+    if (items) return AutocompleteTrie.fromStrings(items) as unknown as Searchable<T>;
     return new AutocompleteTrie<T>();
-  }, [externalTrie, entries, items]);
+  }, [fetchedTrie, packedTrie, externalTrie, entries, items]);
 
   // State
   const isControlled = controlledValue !== undefined;
@@ -315,6 +407,15 @@ export function TrieAutocomplete<T = undefined>(props: TrieAutocompleteProps<T>)
 
   const render = renderSuggestion ?? defaultRenderSuggestion;
   const showDropdown = isOpen && inputValue.length >= minChars;
+
+  // Show loading indicator while fetching from src
+  if (isLoading && loadingIndicator) {
+    return (
+      <div className={className} style={{ ...defaultStyles.container, ...style }}>
+        {loadingIndicator}
+      </div>
+    );
+  }
 
   return (
     <div

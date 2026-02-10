@@ -1,10 +1,27 @@
 {
   "name": "@tristanreid/react-trie-autocomplete",
-  "version": "0.1.0",
-  "description": "A fast, trie-powered autocomplete React component",
+  "version": "0.2.0",
+  "description": "A fast, trie-powered autocomplete React component with packed radix trie serialization",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./pack": {
+      "types": "./dist/pack.d.ts",
+      "import": "./dist/pack.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    }
+  },
+  "bin": {
+    "triepack": "dist/cli.js"
+  },
   "files": ["dist"],
   "scripts": {
     "build": "tsc",
@@ -16,9 +33,12 @@
     "autocomplete",
     "trie",
     "prefix-tree",
+    "radix-tree",
     "typeahead",
     "search",
-    "combobox"
+    "combobox",
+    "packed-trie",
+    "serialization"
   ],
   "author": "Tristan Reid <tristan@tristancode.com>",
   "license": "MIT",
@@ -31,10 +51,19 @@
     "react": ">=18.0.0",
     "react-dom": ">=18.0.0"
   },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    },
+    "react-dom": {
+      "optional": true
+    }
+  },
   "devDependencies": {
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "@types/react": "^19.0.0",
+    "@types/node": "^22.0.0",
     "typescript": "^5.9.3"
   }
 }
